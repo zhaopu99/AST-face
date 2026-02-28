@@ -1,0 +1,8 @@
+{
+    "bfm_name": "testdata/astface_show/bfm_show_au27.obj",
+    "before_scan_path": "testdata/00001/scan.obj",
+    "before_landmark_path": "testdata/00001/landmarks.npy",
+    "after_scan_name": "testdata/astface_show/show_au27.obj",
+    "after_landmark_name": "testdata/astface_show/show_au27_landmarks.txt",
+    "path_out_mesh": "result/out_mesh.obj"
+}
