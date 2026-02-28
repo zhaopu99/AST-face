@@ -25,7 +25,7 @@ pip install seaborn
 
 ## Required inputs
 
-- **Template mesh (BFM topology)**: e.g., `testdata/astface_show/bfm_show_au27.obj`
+- **Template mesh (BFM topology)**: e.g., `result/flame_to_bfm.obj`
 - **Target mesh**: the scan/expression mesh to register, e.g., `testdata/astface_show/show_au27.obj`
 - **Target landmarks (txt)**: `N x 3` 3D landmarks for the target mesh (used for rigid initialization)
 - **Config file (json)**: e.g., `config/fine_grain.json` (inner/outer iterations, weights, schedules)
