@@ -1,63 +1,169 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+01_icp.py — ICP alignment for AST-Face pipeline
+
+This script aligns a source OBJ mesh to a target OBJ mesh using a similarity transform
+(rotation + translation + optional scale) estimated by ICP.
+
+Typical usage (single pair):
+  python 01_icp.py --source path/to/src.obj --target path/to/tgt.obj --out aligned.obj --estimate_scale
+
+Batch usage (align all .obj in a folder to one target):
+  python 01_icp.py --source_dir path/to/folder --target path/to/tgt.obj --inplace
+
+Notes
+- This script replaces only vertex positions ("v ...") and keeps all other OBJ lines.
+- ICP runs on point clouds formed by the mesh vertices (no normals, no faces used for matching).
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
 import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
 import numpy as np
 from scipy.spatial import cKDTree
-from collections import namedtuple
 
-# 定义数据结构
-SimilarityTransform = namedtuple('SimilarityTransform', ['R', 'T', 's'])
-ICPSolution = namedtuple('ICPSolution', ['converged', 'rmse', 'Xt', 'RTs', 't_history'])
+
+# -----------------------------
+# Data structures
+# -----------------------------
+@dataclass(frozen=True)
+class SimilarityTransform:
+    R: np.ndarray  # (3,3)
+    T: np.ndarray  # (3,)
+    s: float       # scalar
+
+
+@dataclass(frozen=True)
+class ICPSolution:
+    converged: bool
+    rmse: float
+    Xt: np.ndarray               # transformed X (in the same normalized space as Y)
+    RTs: SimilarityTransform
+    t_history: List[SimilarityTransform]
+
+
+# -----------------------------
+# OBJ utilities
+# -----------------------------
+def parse_obj_vertices(obj_path: str) -> np.ndarray:
+    """Parse vertices from an OBJ file (lines starting with 'v ')."""
+    verts: List[List[float]] = []
+    with open(obj_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.startswith("v "):
+                parts = line.strip().split()
+                if len(parts) < 4:
+                    continue
+                verts.append([float(parts[1]), float(parts[2]), float(parts[3])])
+    if not verts:
+        raise ValueError(f"No vertices found in OBJ: {obj_path}")
+    return np.asarray(verts, dtype=np.float32)
+
+
+def save_aligned_obj(original_obj_path: str, new_vertices: np.ndarray, output_path: str) -> None:
+    """
+    Write a new OBJ by replacing vertex positions in `original_obj_path` with `new_vertices`,
+    while preserving all other lines (faces, materials, vt/vn, etc.).
+    """
+    vertex_index = 0
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(original_obj_path, "r", encoding="utf-8", errors="ignore") as f_in, \
+         open(out_path, "w", encoding="utf-8") as f_out:
+        for line in f_in:
+            if line.startswith("v "):
+                if vertex_index >= new_vertices.shape[0]:
+                    raise ValueError(
+                        f"Vertex count mismatch: file has more vertices than provided array "
+                        f"({new_vertices.shape[0]})."
+                    )
+                x, y, z = new_vertices[vertex_index]
+                f_out.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
+                vertex_index += 1
+            else:
+                f_out.write(line)
+
+    if vertex_index != new_vertices.shape[0]:
+        raise ValueError(
+            f"Vertex count mismatch: provided {new_vertices.shape[0]} vertices, "
+            f"but wrote {vertex_index} vertices."
+        )
+
+
+# -----------------------------
+# ICP core
+# -----------------------------
+def normalize(points: np.ndarray, eps: float = 1e-8) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Normalize point cloud to unit sphere (centered, scaled)."""
+    centroid = np.mean(points, axis=0)
+    centered = points - centroid
+    scale = float(np.max(np.linalg.norm(centered, axis=1)) + eps)
+    return centered / scale, centroid, scale
+
+
+def denormalize(points_norm: np.ndarray, centroid: np.ndarray, scale: float) -> np.ndarray:
+    """Invert normalize()."""
+    return points_norm * scale + centroid
+
 
 def corresponding_points_alignment(
     X: np.ndarray,
     Y: np.ndarray,
-    weights: np.ndarray = None,
+    weights: Optional[np.ndarray] = None,
     estimate_scale: bool = False,
     allow_reflection: bool = False,
     eps: float = 1e-9
 ) -> SimilarityTransform:
+    """
+    Estimate similarity transform that maps X -> Y (in a least-squares sense).
+    This uses a weighted Procrustes solution with optional uniform scale.
+    """
+    if X.shape != Y.shape:
+        raise ValueError(f"X and Y must have same shape, got {X.shape} vs {Y.shape}")
+
     N, dim = X.shape
-    weights = weights if weights is not None else np.ones(N)
-    total_weight = np.clip(weights.sum(), eps, None)
-    
-    # 加权质心
-    X_mean = (X.T @ weights) / total_weight
-    Y_mean = (Y.T @ weights) / total_weight
-    
-    # 中心化
-    X_centered = X - X_mean
-    Y_centered = Y - Y_mean
-    
-    # 协方差矩阵（使用加权均值）
-    cov_xy = (X_centered.T * weights) @ Y_centered / total_weight
-    
-    # SVD分解
+    w = weights if weights is not None else np.ones((N,), dtype=np.float64)
+    w = w.astype(np.float64)
+    total_w = float(np.clip(w.sum(), eps, None))
+
+    X_mean = (X.T @ w) / total_w
+    Y_mean = (Y.T @ w) / total_w
+
+    Xc = X - X_mean
+    Yc = Y - Y_mean
+
+    cov_xy = (Xc.T * w) @ Yc / total_w
     U, S, Vt = np.linalg.svd(cov_xy)
-    
-    # 处理反射
+
     E = np.eye(dim)
     if not allow_reflection:
         if np.linalg.det(U @ Vt) < 0:
             E[-1, -1] = -1
-    
-    # 关键修正点：计算迹的方式
-    if estimate_scale:
-        x_var = np.sum(weights * np.linalg.norm(X_centered, axis=1)**2) / total_weight
-        scale = (np.sum(S * np.diag(E))) / (x_var + eps)  # 修正后的迹计算
 
+    R = U @ E @ Vt
+
+    if estimate_scale:
+        x_var = float(np.sum(w * np.sum(Xc * Xc, axis=1)) / total_w)
+        scale = float((S * np.diag(E)).sum() / (x_var + eps))
     else:
         scale = 1.0
-    
-    # 计算旋转和平移
-    R = U @ E @ Vt
+
     T = Y_mean - scale * (R @ X_mean)
-    
-    return SimilarityTransform(R, T, scale)
+    return SimilarityTransform(R=R, T=T.astype(np.float64), s=scale)
+
 
 def iterative_closest_point(
-    X: np.ndarray,  # (N, dim)
-    Y: np.ndarray,  # (M, dim)
-    init_transform: SimilarityTransform = None,
+    X: np.ndarray,  # (N,3)
+    Y: np.ndarray,  # (M,3)
+    init_transform: Optional[SimilarityTransform] = None,
     max_iterations: int = 100,
     relative_rmse_thr: float = 1e-6,
     estimate_scale: bool = False,
@@ -65,236 +171,177 @@ def iterative_closest_point(
     verbose: bool = False,
 ) -> ICPSolution:
     """
-    改进后的ICP实现（单样本版本）
+    ICP (single-pair). We solve for a similarity transform from X to Y using nearest neighbors.
     """
+    if X.ndim != 2 or Y.ndim != 2 or X.shape[1] != Y.shape[1]:
+        raise ValueError(f"Expected X,Y shapes (N,3) and (M,3). Got {X.shape}, {Y.shape}")
+
     Xt = X.copy()
-    t_history = []
-    prev_rmse = None
-    
-    # 初始化变换参数
-    if init_transform:
-        R = init_transform.R
-        T = init_transform.T
-        s = init_transform.s
-        Xt = s * (Xt @ R) + T
-    else:
-        R = np.eye(X.shape[1])
-        T = np.zeros(X.shape[1])
-        s = 1.0
-    
+    t_history: List[SimilarityTransform] = []
+    prev_rmse: Optional[float] = None
+
+    # init
+    if init_transform is not None:
+        R0, T0, s0 = init_transform.R, init_transform.T, init_transform.s
+        Xt = s0 * (Xt @ R0) + T0
+    tree = cKDTree(Y)
+
     converged = False
-    for iter in range(max_iterations):
-        # 最近邻搜索
-        tree = cKDTree(Y)
-        _, nn_indices = tree.query(Xt)
-        Y_nn = Y[nn_indices]
-        
-        # 点云对齐
-        transform = corresponding_points_alignment(
+    rmse = float("inf")
+
+    for it in range(max_iterations):
+        _, nn_idx = tree.query(Xt)
+        Y_nn = Y[nn_idx]
+
+        tform = corresponding_points_alignment(
             X, Y_nn,
             estimate_scale=estimate_scale,
             allow_reflection=allow_reflection
         )
-        
-        # 更新变换参数
-        R = transform.R
-        T = transform.T
-        s = transform.s
-        
-        # 应用变换到原始点云
-        Xt = s * (X @ R) + T
-        t_history.append(transform)
-        
-        # 计算RMSE
-        residuals = np.linalg.norm(Xt - Y_nn, axis=1)
-        rmse = np.sqrt(np.mean(residuals**2))
-        
-        # 收敛判断
+
+        Xt = tform.s * (X @ tform.R) + tform.T
+        t_history.append(tform)
+
+        residual = np.linalg.norm(Xt - Y_nn, axis=1)
+        rmse = float(np.sqrt(np.mean(residual * residual)))
+
         if prev_rmse is not None:
-            relative_rmse = abs(prev_rmse - rmse) / prev_rmse
-            if relative_rmse < relative_rmse_thr:
+            rel = abs(prev_rmse - rmse) / max(prev_rmse, 1e-12)
+            if rel < relative_rmse_thr:
                 converged = True
                 break
-        
+
         prev_rmse = rmse
         if verbose:
-            print(f"Iteration {iter+1}: RMSE = {rmse:.6f}")
-    
-    return ICPSolution(
-        converged=converged,
-        rmse=rmse,
-        Xt=Xt,
-        RTs=SimilarityTransform(R, T, s),
-        t_history=t_history
+            print(f"[ICP] iter {it+1:03d}: rmse={rmse:.6f}")
+
+    # compose final transform as the last one in history
+    RTs = t_history[-1] if t_history else SimilarityTransform(R=np.eye(3), T=np.zeros(3), s=1.0)
+    return ICPSolution(converged=converged, rmse=rmse, Xt=Xt, RTs=RTs, t_history=t_history)
+
+
+# -----------------------------
+# CLI
+# -----------------------------
+def _require(path: str) -> None:
+    if not Path(path).exists():
+        raise FileNotFoundError(f"Not found: {Path(path).resolve()}")
+
+
+def align_one(
+    source_obj: str,
+    target_obj: str,
+    out_obj: str,
+    estimate_scale: bool,
+    max_iterations: int,
+    relative_rmse_thr: float,
+    verbose: bool
+) -> ICPSolution:
+    _require(source_obj)
+    _require(target_obj)
+
+    X = parse_obj_vertices(source_obj)
+    Y = parse_obj_vertices(target_obj)
+
+    Xn, _, _ = normalize(X)
+    Yn, Yc, Ys = normalize(Y)
+
+    sol = iterative_closest_point(
+        Xn, Yn,
+        estimate_scale=estimate_scale,
+        max_iterations=max_iterations,
+        relative_rmse_thr=relative_rmse_thr,
+        verbose=verbose
     )
 
-def normalize(points):
-    """点云归一化到单位球内"""
-    centroid = np.mean(points, axis=0)
-    centered = points - centroid
-    scale = np.max(np.linalg.norm(centered, axis=1)) + 1e-8
-    return centered / scale, centroid, scale
+    # denormalize to target space
+    X_aligned = denormalize(sol.Xt, Yc, Ys)
 
-def denormalize(normalized_points: np.ndarray, 
-                centroid: np.ndarray, 
-                scale: float) -> np.ndarray:
-    """
-    将归一化后的点云还原到原始坐标系
-    参数:
-        normalized_points: 归一化后的点云 (N,3)
-        centroid: 原始点云质心 (3,)
-        scale: 原始点云缩放因子 (标量)
-    返回:
-        原始点云 (N,3)
-    """
-    # 1. 恢复缩放: 乘以 scale
-    scaled_points = normalized_points * scale
-    # 2. 恢复平移: 加上质心
-    original_points = scaled_points + centroid
-    return original_points
+    save_aligned_obj(source_obj, X_aligned, out_obj)
+    return sol
 
 
-def save_aligned_obj(
-    original_obj_path: str,      # 原始OBJ文件路径
-    new_vertices: np.ndarray,    # 对齐后的顶点数组 (N,3)
-    output_path: str             # 输出OBJ文件路径
-) -> None:
-    """
-    将配准后的顶点坐标写入新OBJ文件，保留原有面、纹理、材质信息
-    """
-    vertex_index = 0  # 当前处理的顶点索引
-    
-    with open(original_obj_path, 'r') as f_in, open(output_path, 'w') as f_out:
-        for line in f_in:
-            # 处理顶点行：替换为新坐标
-            if line.startswith('v '):
-                if vertex_index >= new_vertices.shape[0]:
-                    raise ValueError("顶点数量不匹配")
-                
-                x, y, z = new_vertices[vertex_index]
-                f_out.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
-                vertex_index += 1
-            
-            # 其他行直接复制（材质、纹理、面等）
-            else:
-                f_out.write(line)
-    
-    print(f"已保存配准后的OBJ文件至: {os.path.abspath(output_path)}")
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="ICP align OBJ meshes (AST-Face step 01).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
 
+    g1 = ap.add_argument_group("single-pair mode")
+    g1.add_argument("--source", type=str, default="", help="Source OBJ to be aligned.")
+    g1.add_argument("--target", type=str, default="", help="Target OBJ (reference).")
+    g1.add_argument("--out", type=str, default="", help="Output OBJ path (single-pair).")
 
-def parse_obj_manually(obj_path: str) -> dict:
-    """
-    手动解析OBJ文件，严格保留顶点、纹理、面的原始顺序
-    返回:
-        {
-            'vertices': np.array (N,3),    # 顶点坐标（顺序与文件一致）
-            'texcoords': np.array (M,2),   # 纹理坐标
-            'faces': list of face_defs     # 面定义（原始字符串）
-        }
-    """
-    vertices = []
-    texcoords = []
-    faces = []
-    
-    with open(obj_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            parts = line.split()
-            
-            if parts[0] == 'v':
-                # 顶点坐标: v x y z
-                vertices.append([float(parts[1]), float(parts[2]), float(parts[3])])
-            elif parts[0] == 'vt':
-                # 纹理坐标: vt u v
-                texcoords.append([float(parts[1]), float(parts[2])])
-            elif parts[0] == 'f':
-                # 面定义: f v1/vt1 v2/vt2 v3/vt3
-                faces.append(' '.join(parts[1:]))
-    
-    return {
-        'vertices': np.array(vertices, dtype=np.float32),
-        'texcoords': np.array(texcoords, dtype=np.float32),
-        'faces': faces
-    }
+    g2 = ap.add_argument_group("batch mode")
+    g2.add_argument("--source_dir", type=str, default="", help="Folder containing OBJ files to align.")
+    g2.add_argument("--out_dir", type=str, default="", help="Output folder for aligned OBJs.")
+    g2.add_argument("--inplace", action="store_true", help="Overwrite OBJs in source_dir (batch mode).")
 
+    ap.add_argument("--estimate_scale", action="store_true", help="Estimate uniform scale during ICP.")
+    ap.add_argument("--max_iterations", type=int, default=100, help="Max ICP iterations.")
+    ap.add_argument("--relative_rmse_thr", type=float, default=1e-6, help="Relative RMSE threshold for convergence.")
+    ap.add_argument("--verbose", action="store_true", help="Print per-iteration RMSE.")
 
+    args = ap.parse_args()
 
-def icp_folder(folder_path, target_scan_path):
-    # 加载模型A和B的顶点（假设B为目标模型）
-    target = parse_obj_manually(target_scan_path)['vertices']
-    target_norm, target_centroid, target_scale = normalize(target)
+    # Determine mode
+    if args.source_dir:
+        if not args.target:
+            raise ValueError("--target is required for --source_dir mode.")
+        _require(args.target)
+        src_dir = Path(args.source_dir)
+        if not src_dir.exists():
+            raise FileNotFoundError(f"--source_dir not found: {src_dir.resolve()}")
 
-    for obj_scan_path in os.listdir(folder_path):
-        if obj_scan_path.endswith('.obj'):
-            print(obj_scan_path)
-            t1 = time.time()
-            scan_path = os.path.join(folder_path, obj_scan_path)
-            X = parse_obj_manually(scan_path)['vertices']
-            X_norm, scan_centroid, scan_scale = normalize(X)
-            result = iterative_closest_point(X_norm, target_norm, estimate_scale=True)
-            print("\n对齐结果:")
-            print(f"收敛状态: {result.converged}")
-            print(f"最终RMSE: {result.rmse:.6f}")
-            print("估计旋转矩阵:\n", result.RTs.R.round(2))
-            print("估计平移向量:", result.RTs.T.round(2))
-            print("估计缩放因子:", result.RTs.s.round(3))
+        if args.inplace:
+            out_dir = src_dir
+        else:
+            if not args.out_dir:
+                raise ValueError("--out_dir is required unless --inplace is set.")
+            out_dir = Path(args.out_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
 
-            restored_points = denormalize(result.Xt, target_centroid, target_scale)
+        obj_files = sorted([p for p in src_dir.rglob("*.obj")])
+        if not obj_files:
+            raise ValueError(f"No .obj files found under: {src_dir.resolve()}")
 
-            t2 = time.time()
-            print(t2-t1)
-            save_aligned_obj(
-                original_obj_path=scan_path,
-                new_vertices=restored_points,
-                output_path=scan_path
+        print(f"[ICP] batch mode: {len(obj_files)} files")
+        for p in obj_files:
+            rel = p.relative_to(src_dir)
+            out_path = (out_dir / rel) if not args.inplace else p
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            t0 = time.time()
+            sol = align_one(
+                source_obj=str(p),
+                target_obj=args.target,
+                out_obj=str(out_path),
+                estimate_scale=args.estimate_scale,
+                max_iterations=args.max_iterations,
+                relative_rmse_thr=args.relative_rmse_thr,
+                verbose=args.verbose
             )
-            t3 = time.time()
-            print(t3-t2)
+            dt = time.time() - t0
+            print(f"[ICP] {rel} -> {out_path.name} | rmse={sol.rmse:.6f} | converged={sol.converged} | {dt:.2f}s")
+        return
 
-        
+    # single pair
+    if not (args.source and args.target and args.out):
+        raise ValueError("Single-pair mode requires --source, --target, and --out (or use --source_dir batch mode).")
 
-# 使用示例
-if __name__ == "__main__":
-    
-    path1 = ''  ## obj path
-    path2 = ''  ## target obj
     t0 = time.time()
-    X = parse_obj_manually(path1)['vertices']
-    Y = parse_obj_manually(path2)['vertices']
-    print('check')
-    t1 = time.time()
-    print(t1-t0)
-    X_norm, scan_centroid, scan_scale = normalize(X)
-    Y_norm, target_centroid, target_scale = normalize(Y)
-
-    # 运行ICP
-    result = iterative_closest_point(X_norm, Y_norm, estimate_scale=True)
-
-    print("\n对齐结果:")
-    print(f"收敛状态: {result.converged}")
-    print(f"最终RMSE: {result.rmse:.6f}")
-    print("估计旋转矩阵:\n", result.RTs.R.round(2))
-    print("估计平移向量:", result.RTs.T.round(2))
-    print("估计缩放因子:", result.RTs.s.round(3))
-
-    transformed_X = (X_norm @ result.RTs.R.T) * result.RTs.s + result.RTs.T 
-    restored_points = denormalize(result.Xt, target_centroid, target_scale)
-    
-    t2 = time.time()
-    print(t2-t1)
-    save_aligned_obj(
-        original_obj_path=path1,
-        new_vertices=restored_points,
-        output_path="aligned_result.obj"
+    sol = align_one(
+        source_obj=args.source,
+        target_obj=args.target,
+        out_obj=args.out,
+        estimate_scale=args.estimate_scale,
+        max_iterations=args.max_iterations,
+        relative_rmse_thr=args.relative_rmse_thr,
+        verbose=args.verbose
     )
-    t3 = time.time()
-    print(t3-t2)
+    dt = time.time() - t0
+    print(f"[ICP] done | rmse={sol.rmse:.6f} | converged={sol.converged} | {dt:.2f}s")
 
-    '''
-    path1 = '' ## obj folder
-    path2 = '' ## target obj
-   
-    icp_folder(path1, path2)
-    '''
+
+if __name__ == "__main__":
+    main()
