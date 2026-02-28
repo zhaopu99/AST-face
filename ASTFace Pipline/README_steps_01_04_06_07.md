@@ -158,7 +158,7 @@ project_root/
     landmarks/             # step 02 outputs
     fitted_flame/          # step 03 outputs
     flame_to_bfm/          # step 04 outputs
-    nicp_registered/       # step 05 outputs (topology-unified meshes after Edge-NICP)
+    edge_nicp_meshes/       # step 05 outputs (topology-unified meshes after Edge-NICP)
     cropped/               # step 06 outputs
     deformation_fields/    # step 07 outputs
   scripts/
