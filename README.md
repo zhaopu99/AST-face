@@ -42,10 +42,6 @@ The public release includes anonymized, non-textured derived data and annotation
 - `scipy`
 - `pytorch3d`
 
-### Reproducible environment (recommended)
-Please use the provided environment specification files (if included in this repository), e.g.:
-- `environment.yml` (conda)
-- `requirements.txt` (pip)
 
 > Some stages (especially FLAME fitting and Edge-NICP topology unification) require a CUDA-enabled PyTorch3D installation and a compatible PyTorch/CUDA version stack.
 
@@ -83,7 +79,6 @@ Controlled-access data are hosted in restricted OSF components (currently split 
    - A copy may also be mirrored in this GitHub repository for convenience.
 3. Read, complete, and sign the DUA.
 4. Send the signed DUA to **zhaoyaopu@buaa.edu.cn**  
-   - Suggested subject line: `AST-Face Controlled-Access Data Request`
 
 ### How access is granted
 After identity verification and confirmation of the signed DUA, access is granted via **OSF’s permission mechanism** by adding the requester as a **read-only contributor** to the restricted OSF components.
